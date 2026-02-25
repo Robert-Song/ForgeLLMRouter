@@ -1,0 +1,23 @@
+# Python and Environments
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+env/
+
+# Database files
+*.db
+token_usage.db
+
+# Project-Specific Builds / Binaries
+llama.cpp/
+llama-server
+
+# Logs
+model_logs/
+*.log
+
+secret.sh
+secrets.yaml
+keys.txt
