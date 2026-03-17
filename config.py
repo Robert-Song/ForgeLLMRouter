@@ -16,6 +16,17 @@ TOTAL_USABLE_MEMORY_GB = sum(GPU_MEMORY_GB)  # 180 GB for aiforge
 GPU_HEADROOM_GB = 2
 
 
+# TIMEZONE SETTING
+import os as _os
+import time as _time
+
+# Force timezone to Eastern Time (EST/EDT)
+_os.environ['TZ'] = 'America/New_York'
+try:
+    _time.tzset()
+except AttributeError:
+    pass
+
 ### MODEL FILE PATHS ###
 
 # Base directory for locally-stored GGUF files (llama.cpp models)

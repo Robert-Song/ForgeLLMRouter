@@ -8,6 +8,10 @@ Usage:
 """
 
 import argparse
+import copy
+import logging
+import os
+import time
 
 from config import PROXY_HOST, PROXY_PORT
 
@@ -51,7 +55,13 @@ def main():
 
     import uvicorn
     from proxy_server import app
-    uvicorn.run(app, host=args.host, port=args.port)
+    # uvicorn.run(app, host=args.host, port=args.port) -> no log version
+
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s | %(levelprefix)s %(message)s"
+
+    # disable uvicorn's default log, use custom middleware
+    uvicorn.run(app, host=args.host, port=args.port, log_config=log_config, access_log=False)
 
 
 if __name__ == "__main__":

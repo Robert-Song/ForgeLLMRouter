@@ -13,6 +13,11 @@ import asyncio
 import httpx
 import json
 
+import logging
+import time
+
+logger = logging.getLogger("uvicorn.error")
+
 from db import init_db, get_key_limit, get_total_usage, log_usage
 from models import MODEL_REGISTRY, list_all_model_ids
 from request_queue import request_queue
@@ -34,7 +39,24 @@ async def lifespan(app: FastAPI):
     await request_queue.stop()
     await process_manager.cleanup()
 
-app = FastAPI(title="OpenAI Proxy v5 (Dual Backend)", lifespan=lifespan)
+app = FastAPI(title="OpenAI Proxy v6", lifespan=lifespan)
+
+@app.middleware("http")
+async def custom_access_log(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    
+    # HTTP status code might literally be an error code but uvicorn just says OK
+    status_text = "OK" if response.status_code < 400 else "ERROR"
+    model = getattr(request.state, "model", "N/A")
+    
+    client_host = request.client.host if request.client else "unknown"
+    client_port = request.client.port if request.client else 0
+    
+    logger.info(f'{client_host}:{client_port} - "{request.method} {request.url.path} HTTP/{request.scope.get("http_version", "1.1")}" {response.status_code} {status_text} - Model: {model} ({process_time:.2f}s)')
+    
+    return response
 
 
 # ============================================================================
@@ -186,6 +208,8 @@ async def chat_completions(
     api_key = _extract_api_key(authorization)
     body = await request.json()
 
+    request.state.model = body.get("model", "") #for model logging
+
     # Pre-flight quota check
     request_text = json.dumps(body.get("messages", []))
     estimated = estimate_tokens(request_text) * 2
@@ -260,6 +284,8 @@ async def create_embeddings(
     api_key = _extract_api_key(authorization)
     body = await request.json()
 
+    request.state.model = body.get("model", "") #for model logging
+
     # Extract input text
     input_data = body.get("input", "")
     if isinstance(input_data, str):
@@ -321,6 +347,8 @@ async def rerank(
 
     api_key = _extract_api_key(authorization)
     body = await request.json()
+
+    request.state.model = body.get("model", "") #for model logging
 
     # Quota check on query + documents
     query = body.get("query", "")
