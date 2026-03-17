@@ -1,4 +1,4 @@
-# OpenAI Proxy v6
+# ForgeLLMRouter
 
 A FastAPI-based proxy server designed to host and route OpenAI-compatible API requests to local language models, dynamically managing memory and subprocesses (`vLLM` and `llama.cpp`).
 
