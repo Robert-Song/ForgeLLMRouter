@@ -140,7 +140,7 @@ _register(
     ModelInfo(
         model_id="gemma4:26b-a4b-it-q8_0",
         backend="llamacpp",
-        backend_id="gemma-4-26B-A4B-it-Q8_0.gguf",
+        backend_id="gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf",
         memory_gb=35.0,
         model_type="chat",
         extra_args="--ctx-size 65536",
