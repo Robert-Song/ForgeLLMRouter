@@ -100,6 +100,9 @@ class ModelProcessManager:
                 "-m", model_path,
                 "--port", str(port),
             ]
+            if getattr(model_info, "mmproj_id", None):
+                mmproj_path = os.path.join(GGUF_MODEL_DIR, model_info.mmproj_id)
+                cmd.extend(["--mmproj", mmproj_path])
             if model_info.extra_args:
                 cmd.extend(shlex.split(model_info.extra_args))
 

@@ -68,6 +68,69 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+IMAGE_TOKEN_ESTIMATE = 1024
+
+
+def _is_image_content_part(part) -> bool:
+    """Return True for OpenAI-style image content parts."""
+    if not isinstance(part, dict):
+        return False
+
+    part_type = part.get("type")
+    return part_type in {"image_url", "input_image"} or "image_url" in part
+
+
+def _messages_contain_image(messages) -> bool:
+    """Detect whether chat messages include image input."""
+    if not isinstance(messages, list):
+        return False
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        if any(_is_image_content_part(part) for part in content):
+            return True
+
+    return False
+
+
+def _estimate_chat_quota_tokens(messages) -> int:
+    """Estimate chat quota while avoiding counting base64 image payload bytes."""
+    text_chunks = []
+    image_count = 0
+
+    if not isinstance(messages, list):
+        messages = [messages]
+
+    for message in messages:
+        content = message.get("content", "") if isinstance(message, dict) else message
+
+        if isinstance(content, str):
+            text_chunks.append(content)
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        for part in content:
+            if isinstance(part, str):
+                text_chunks.append(part)
+            elif isinstance(part, dict):
+                if _is_image_content_part(part):
+                    image_count += 1
+                elif "text" in part:
+                    text_chunks.append(str(part.get("text", "")))
+
+    text_estimate = estimate_tokens(" ".join(text_chunks)) * 2
+    image_estimate = image_count * IMAGE_TOKEN_ESTIMATE
+    return text_estimate + image_estimate
+
+
 def _extract_api_key(authorization: Optional[str]) -> str:
     """Extract and validate API key from the Authorization header."""
     if not authorization:
@@ -210,11 +273,6 @@ async def chat_completions(
 
     request.state.model = body.get("model", "") #for model logging
 
-    # Pre-flight quota check
-    request_text = json.dumps(body.get("messages", []))
-    estimated = estimate_tokens(request_text) * 2
-    _check_quota(api_key, estimated)
-
     # Validate model exists in our registry
     requested_model = body.get("model", "")
     if requested_model not in MODEL_REGISTRY:
@@ -225,6 +283,23 @@ async def chat_completions(
                 f"Available: {list_all_model_ids()}"
             ),
         )
+
+    model_info = MODEL_REGISTRY[requested_model]
+    messages = body.get("messages", [])
+    has_image_input = _messages_contain_image(messages)
+    if has_image_input and "image" not in model_info.modalities:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{requested_model}' does not support image input. "
+                "Use a model with image modality support."
+            ),
+        )
+
+    # Pre-flight quota check. Count text normally and charge a fixed estimate
+    # per image instead of counting base64 payload bytes as text tokens.
+    estimated = _estimate_chat_quota_tokens(messages)
+    _check_quota(api_key, estimated)
 
     # Streaming path: bypass request_queue, stream directly from model backend
     if body.get("stream", False):
