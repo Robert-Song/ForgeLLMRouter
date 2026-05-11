@@ -8,6 +8,7 @@ Each model has:
   - backend_id:   GGUF filename (for llamacpp) or HuggingFace model ID (for vllm)
   - memory_gb:    Estimated GPU VRAM needed to load the model
   - model_type:   "chat", "embedding", or "reranker"
+  - modalities:   Supported input modalities, e.g. ("text", "image")
 
 Backend decision rule:
   - Small models (≤~10B params), embeddings, rerankers → llamacpp
@@ -32,6 +33,8 @@ class ModelInfo:
     group: str = ""                 # Assigned later by build_groups()
     gpu_index: Optional[int] = None # Which GPU to place on (None = auto)
     extra_args: str = ""            # Extra CLI flags for the backend
+    modalities: tuple[str, ...] = ("text",)  # Supported input modalities
+    mmproj_id: Optional[str] = None # Multimodal projector GGUF filename
 
 
 # MODEL REGISTRY
@@ -152,6 +155,8 @@ _register(
         memory_gb=40.0,
         model_type="chat",
         extra_args="--ctx-size 65536",
+        modalities=("text", "image"),
+        mmproj_id="mmproj-BF16.gguf",
     ),
 
     # ---- CHAT MODELS (large → vllm (currently unused)) ----
