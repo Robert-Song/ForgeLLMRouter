@@ -6,14 +6,15 @@ Change the values at the top to match your HPC environment.
 
 ### HPC RESOURCE CONSTANTS ###
 
-# GPU memory available for model loading (in GB).
-# Set conservatively to leave room for other users (I recommend so...?)
-GPU_MEMORY_GB = [40, 40, 40]           # Available VRAM per GPU (list, one per GPU) 96GB? I think
-NUM_GPUS = len(GPU_MEMORY_GB)
-TOTAL_USABLE_MEMORY_GB = sum(GPU_MEMORY_GB)  # 180 GB for aiforge
+# GPU memory available for model loading (in GB). Set a GPU to 0 to exclude it
+# from both the scheduler budget and backend CUDA visibility.
+GPU_MEMORY_GB = [42, 0, 42]
+GPU_VISIBLE_DEVICES = [idx for idx, gb in enumerate(GPU_MEMORY_GB) if gb > 0]
+NUM_GPUS = len(GPU_VISIBLE_DEVICES)
+TOTAL_USABLE_MEMORY_GB = sum(GPU_MEMORY_GB)
 
-# Safety margin: don't fill GPU to 100%, leave headroom (# in GB per GPU)
-GPU_HEADROOM_GB = 2
+# Safety margin: don't fill GPU to 100%, leave headroom (# in GB per visible GPU)
+GPU_HEADROOM_GB = 3
 
 
 # TIMEZONE SETTING
@@ -38,10 +39,32 @@ VLLM_MODEL_DIR = "/.gavea/store/song669/temp/vllm_models/"
 #VLLM_MODEL_DIR = "/scratch2/ribeirob/models"
 
 # HuggingFace token for gated models (set via env)
+import glob as _glob
 import os as _os
 HF_TOKEN = _os.environ.get("HF_TOKEN", "")#HACK NEED TO CHANGE THIS LATER
 # CUDA library path (needed by llama-server/llama-swap)
-CUDA_LIB_PATH = "/p/cuda-12.3/targets/x86_64-linux/lib"
+_REPO_DIR = _os.path.dirname(_os.path.abspath(__file__))
+_CUDA_LIB_PATHS = [
+    "/p/cuda-12.3/targets/x86_64-linux/lib",
+]
+for _package in ("cuda_runtime", "cublas", "nccl"):
+    _CUDA_LIB_PATHS.extend(
+        _glob.glob(
+            _os.path.join(
+                _REPO_DIR,
+                ".venv",
+                "lib",
+                "python*",
+                "site-packages",
+                "nvidia",
+                _package,
+                "lib",
+            )
+        )
+    )
+CUDA_LIB_PATH = _os.pathsep.join(
+    dict.fromkeys(path for path in _CUDA_LIB_PATHS if _os.path.isdir(path))
+)
 
 # llama-server binary path (from llama.cpp build)
 # XXX: this line is CPU only version, only use to test, do not use actually
@@ -74,6 +97,11 @@ LRU_CACHE_SIZE = 128               # max entries in LRU scheduling cache
 # Upper bound for automatically-selected llama.cpp parallel slots per model.
 # Models can still set a smaller explicit parallel_slots value in models.py.
 MAX_PARALLEL_SLOTS = 4
+
+# llama.cpp's fit/load behavior can reserve substantially more VRAM than the
+# static GGUF tensor + KV estimates, especially with parallel slots. Keep one
+# active model loaded at a time unless a request targets an already-loaded model.
+UNLOAD_IDLE_MODELS_BEFORE_LOAD = True
 
 
 ### DATABASE

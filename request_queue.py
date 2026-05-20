@@ -19,6 +19,7 @@ from config import (
     MAX_QUEUE_SIZE,
     NUM_GPUS,
     TOTAL_USABLE_MEMORY_GB,
+    UNLOAD_IDLE_MODELS_BEFORE_LOAD,
 )
 from model_resources import (
     effective_model_memory_gb,
@@ -52,6 +53,7 @@ class ModelRuntimeState:
     semaphore: asyncio.Semaphore
     load_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     inflight: int = 0
+    loading: bool = False
 
 
 class MemoryBudget:
@@ -99,6 +101,9 @@ class MemoryBudget:
 
     def evict(self, model_id: str):
         self._loaded.pop(model_id, None)
+
+    def loaded_model_ids(self) -> List[str]:
+        return list(self._loaded.keys())
 
     def fits(self, model_id: str) -> bool:
         if self.is_loaded(model_id):
@@ -237,7 +242,7 @@ class RequestQueue:
     def _busy_model_ids(self) -> set[str]:
         return {
             model_id for model_id, state in self._runtimes.items()
-            if state.inflight > 0
+            if state.inflight > 0 or state.loading
         }
 
     async def _process_loop(self):
@@ -343,19 +348,45 @@ class RequestQueue:
 
         runtime = self._runtime_for(model_id)
         async with runtime.load_lock:
-            if model_id in process_manager.active_processes:
-                async with self._memory_condition:
+            async with self._memory_condition:
+                if model_id in process_manager.active_processes:
                     self._memory.touch(model_id)
                     self._memory_condition.notify_all()
-                return process_manager.model_ports[model_id]
+                    return process_manager.model_ports[model_id]
 
-            async with self._memory_condition:
                 needed = self._memory.model_memory_gb(model_id)
                 if needed > self._memory.budget_gb:
                     raise RuntimeError(
                         f"Model '{model_id}' needs {needed:.1f} GB, "
                         f"exceeding memory budget {self._memory.budget_gb:.1f} GB"
                     )
+
+                if UNLOAD_IDLE_MODELS_BEFORE_LOAD:
+                    while True:
+                        protected = self._busy_model_ids()
+                        other_loaded = [
+                            loaded_id
+                            for loaded_id in self._memory.loaded_model_ids()
+                            if loaded_id != model_id
+                        ]
+                        to_evict = [
+                            loaded_id
+                            for loaded_id in other_loaded
+                            if loaded_id not in protected
+                        ]
+                        if to_evict:
+                            print(
+                                f"[request_queue] Unloading idle models {to_evict} "
+                                f"before loading '{model_id}'"
+                            )
+                            for evict_id in to_evict:
+                                await process_manager.unload_model(evict_id)
+                                self._memory.evict(evict_id)
+                            continue
+                        if other_loaded:
+                            await self._memory_condition.wait()
+                            continue
+                        break
 
                 while not self._memory.fits(model_id):
                     to_evict = self._memory.models_to_evict(model_id, self._busy_model_ids())
@@ -368,18 +399,20 @@ class RequestQueue:
                     await self._memory_condition.wait()
 
                 self._memory.touch(model_id)
+                runtime.loading = True
 
+            load_succeeded = False
             try:
                 await process_manager.load_model(model_id, model_info)
-            except Exception:
+                load_succeeded = True
+            finally:
                 async with self._memory_condition:
-                    self._memory.evict(model_id)
+                    runtime.loading = False
+                    if load_succeeded:
+                        self._memory.touch(model_id)
+                    else:
+                        self._memory.evict(model_id)
                     self._memory_condition.notify_all()
-                raise
-
-            async with self._memory_condition:
-                self._memory.touch(model_id)
-                self._memory_condition.notify_all()
 
             return process_manager.model_ports[model_id]
 
@@ -407,12 +440,12 @@ class RequestQueue:
         runtime = self._runtime_for(model_id)
         acquired = False
         try:
-            await self._set_request_state(req, "waiting_model")
-            port = await self.ensure_model_loaded(model_id)
             await self._set_request_state(req, "waiting_slot")
             await runtime.semaphore.acquire()
             acquired = True
             runtime.inflight += 1
+            await self._set_request_state(req, "waiting_model")
+            port = await self.ensure_model_loaded(model_id)
             await self._set_request_state(req, "inflight")
             yield port
         finally:

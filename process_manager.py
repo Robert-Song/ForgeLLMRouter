@@ -219,7 +219,7 @@ class ModelProcessManager:
         
         from config import (
             GGUF_MODEL_DIR, VLLM_MODEL_DIR, LLAMA_SERVER_BIN, 
-            CUDA_LIB_PATH, HF_TOKEN, NUM_GPUS
+            CUDA_LIB_PATH, GPU_VISIBLE_DEVICES, HF_TOKEN, NUM_GPUS
         )
         
         env = os.environ.copy()
@@ -229,6 +229,8 @@ class ModelProcessManager:
 
         if getattr(model_info, "gpu_index", None) is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(model_info.gpu_index)
+        elif GPU_VISIBLE_DEVICES:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(idx) for idx in GPU_VISIBLE_DEVICES)
 
         # Build the command based on backend
         if backend == "vllm":

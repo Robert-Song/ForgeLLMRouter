@@ -179,17 +179,17 @@ def estimate_slot_memory_gb(model_info) -> float:
 def effective_parallel_slots(model_info, budget_gb: float = MEMORY_BUDGET_GB) -> int:
     configured = int(getattr(model_info, "parallel_slots", 0) or 0)
     if configured > 0:
-        return configured
+        return max(1, min(MAX_PARALLEL_SLOTS, configured))
 
     base_memory = estimate_base_memory_gb(model_info)
     slot_memory = estimate_slot_memory_gb(model_info)
     if slot_memory <= 0 or base_memory >= budget_gb:
         return 1
 
-    slots = int((budget_gb - base_memory) // slot_memory) + 1
+    slots = int((budget_gb - base_memory) // slot_memory)
     return max(1, min(MAX_PARALLEL_SLOTS, slots))
 
 
 def effective_model_memory_gb(model_info, budget_gb: float = MEMORY_BUDGET_GB) -> float:
     slots = effective_parallel_slots(model_info, budget_gb=budget_gb)
-    return estimate_base_memory_gb(model_info) + max(0, slots - 1) * estimate_slot_memory_gb(model_info)
+    return estimate_base_memory_gb(model_info) + slots * estimate_slot_memory_gb(model_info)
