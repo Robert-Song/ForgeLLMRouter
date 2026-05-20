@@ -6,7 +6,6 @@ mostly extracted from proxy_v3
 
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import StreamingResponse, JSONResponse
-from starlette.background import BackgroundTask
 from contextlib import asynccontextmanager
 from typing import Optional
 import asyncio
@@ -192,6 +191,10 @@ async def _forward_to_model(model_id: str, port: int, request_body: dict, api_ke
                 await asyncio.sleep(delay)
                 continue
 
+            if response.status_code != 200:
+                request_size = len(json.dumps(request_body))
+                print(f"[Forward] Error from model backend for '{model_id}': status={response.status_code}, request_size={request_size}, response={response.text[:500]}")
+            
             response.raise_for_status()
             return response.json()
 
@@ -244,9 +247,7 @@ async def admin_unload_all(authorization: Optional[str] = Header(None)):
     api_key = _extract_api_key(authorization)
     # Optional: ensure api_key belongs to an admin user
     
-    loaded_models = list(process_manager.active_processes.keys())
-    for model_id in loaded_models:
-        await process_manager.unload_model(model_id)
+    loaded_models = await request_queue.unload_all(force=True)
         
     return JSONResponse(content={"status": "success", "unloaded": loaded_models})
 
@@ -258,8 +259,14 @@ async def admin_unload_model(model_id: str, authorization: Optional[str] = Heade
     if model_id not in process_manager.active_processes:
         return JSONResponse(status_code=404, content={"status": "error", "detail": "Model not loaded"})
         
-    await process_manager.unload_model(model_id)
+    await request_queue.unload_model(model_id, force=True)
     return JSONResponse(content={"status": "success", "unloaded": model_id})
+
+@app.get("/v1/admin/status")
+async def admin_status(authorization: Optional[str] = Header(None)):
+    """Inspectable proxy status: queue, inflight requests, loaded models, memory, and llama.cpp slots."""
+    api_key = _extract_api_key(authorization)
+    return JSONResponse(content=await request_queue.snapshot(include_backend=True))
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
@@ -301,15 +308,33 @@ async def chat_completions(
     estimated = _estimate_chat_quota_tokens(messages)
     _check_quota(api_key, estimated)
 
-    # Streaming path: bypass request_queue, stream directly from model backend
+    # Streaming path: hold a scheduler slot until the stream is closed.
     if body.get("stream", False):
-        port = await request_queue.ensure_model_loaded(requested_model)
-
+        try:
+            lease = request_queue.model_slot(requested_model, endpoint_type="chat", stream=True)
+            port = await lease.__aenter__()
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
         client = httpx.AsyncClient(timeout=3600.0)
+
+        async def stream_with_cleanup():
+            exc = None
+            try:
+                async for chunk in _stream_from_model(client, port, body, api_key):
+                    yield chunk
+            except Exception as e:
+                exc = e
+                raise
+            finally:
+                await client.aclose()
+                if exc:
+                    await lease.__aexit__(type(exc), exc, exc.__traceback__)
+                else:
+                    await lease.__aexit__(None, None, None)
+
         return StreamingResponse(
-            _stream_from_model(client, port, body, api_key),
+            stream_with_cleanup(),
             media_type="text/event-stream",
-            background=BackgroundTask(client.aclose),
         )
 
     # Non-streaming path: use the batch request_queue
@@ -347,6 +372,8 @@ async def chat_completions(
             status_code=502,
             detail=f"Model backend returned error {e.response.status_code}: {e.response.text[:200]}",
         )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/v1/embeddings")
@@ -379,25 +406,25 @@ async def create_embeddings(
 
     # Forward to model backend
     try:
-        port = await request_queue.ensure_model_loaded(model)
-        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=3600.0) as client:
-            response = await client.post("/v1/embeddings", json=body)
-            response.raise_for_status()
-            response_data = response.json()
+        async with request_queue.model_slot(model, endpoint_type="embedding") as port:
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=3600.0) as client:
+                response = await client.post("/v1/embeddings", json=body)
+                response.raise_for_status()
+                response_data = response.json()
 
-            # Log usage
-            if "usage" in response_data:
-                usage_data = response_data["usage"]
-                log_usage(
-                    api_key,
-                    usage_data.get("total_tokens", estimated),
-                    usage_data.get("prompt_tokens", estimated),
-                    0,
-                )
-            else:
-                log_usage(api_key, estimated, estimated, 0)
+                # Log usage
+                if "usage" in response_data:
+                    usage_data = response_data["usage"]
+                    log_usage(
+                        api_key,
+                        usage_data.get("total_tokens", estimated),
+                        usage_data.get("prompt_tokens", estimated),
+                        0,
+                    )
+                else:
+                    log_usage(api_key, estimated, estimated, 0)
 
-            return JSONResponse(content=response_data)
+                return JSONResponse(content=response_data)
 
     except httpx.ConnectError:
         raise HTTPException(
@@ -411,6 +438,8 @@ async def create_embeddings(
             status_code=502,
             detail=f"Model backend error {e.response.status_code}: {e.response.text[:200]}",
         )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/v1/rerank")
@@ -438,14 +467,13 @@ async def rerank(
 
     # Forward to model backend
     try:
-        port = await request_queue.ensure_model_loaded(model)
-
-        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=3600.0) as client:
-            response = await client.post("/v1/rerank", json=body)
-            response.raise_for_status()
-            response_data = response.json()
-            log_usage(api_key, estimated, estimated, 0)
-            return JSONResponse(content=response_data)
+        async with request_queue.model_slot(model, endpoint_type="rerank") as port:
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=3600.0) as client:
+                response = await client.post("/v1/rerank", json=body)
+                response.raise_for_status()
+                response_data = response.json()
+                log_usage(api_key, estimated, estimated, 0)
+                return JSONResponse(content=response_data)
 
     except httpx.ConnectError:
         raise HTTPException(
@@ -457,6 +485,8 @@ async def rerank(
             status_code=502,
             detail=f"Model backend error {e.response.status_code}: {e.response.text[:200]}",
         )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.get("/v1/models")

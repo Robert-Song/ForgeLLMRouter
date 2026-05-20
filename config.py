@@ -8,7 +8,7 @@ Change the values at the top to match your HPC environment.
 
 # GPU memory available for model loading (in GB).
 # Set conservatively to leave room for other users (I recommend so...?)
-GPU_MEMORY_GB = [90, 90]           # Available VRAM per GPU (list, one per GPU) 96GB? I think
+GPU_MEMORY_GB = [40, 40, 40]           # Available VRAM per GPU (list, one per GPU) 96GB? I think
 NUM_GPUS = len(GPU_MEMORY_GB)
 TOTAL_USABLE_MEMORY_GB = sum(GPU_MEMORY_GB)  # 180 GB for aiforge
 
@@ -30,14 +30,16 @@ except AttributeError:
 ### MODEL FILE PATHS ###
 
 # Base directory for locally-stored GGUF files (llama.cpp models)
-GGUF_MODEL_DIR = "/scratch2/ribeirob/models"
+GGUF_MODEL_DIR = "/.gavea/store/song669/temp/gguf_models/"
+#GGUF_MODEL_DIR = "/scratch2/ribeirob/models"
 
 # Directory for vLLM/HuggingFace model downloads
-VLLM_MODEL_DIR = "/scratch2/ribeirob/models"
+VLLM_MODEL_DIR = "/.gavea/store/song669/temp/vllm_models/"
+#VLLM_MODEL_DIR = "/scratch2/ribeirob/models"
 
 # HuggingFace token for gated models (set via env)
 import os as _os
-HF_TOKEN = _os.environ.get("HF_TOKEN", "")
+HF_TOKEN = _os.environ.get("HF_TOKEN", "")#HACK NEED TO CHANGE THIS LATER
 # CUDA library path (needed by llama-server/llama-swap)
 CUDA_LIB_PATH = "/p/cuda-12.3/targets/x86_64-linux/lib"
 
@@ -46,8 +48,8 @@ CUDA_LIB_PATH = "/p/cuda-12.3/targets/x86_64-linux/lib"
 # LLAMA_SERVER_BIN = "/.gavea/store/song669/temp/llama-b7999/llama-server"
 
 # this is the GPU version
-LLAMA_SERVER_BIN = "/.gavea/store/song669/temp/llama.cpp/build/bin/llama-server"
-# LLAMA_SERVER_BIN = "llama.cpp/build/bin/llama-server"
+#LLAMA_SERVER_BIN = "/.gavea/store/song669/temp/llama.cpp/build/bin/llama-server"
+LLAMA_SERVER_BIN = "/.gavea/store/song669/clean/ForgeLLMRouter/llama.cpp/build/bin/llama-server"
 
 ### PROXY / SERVER SETTINGS ###
 
@@ -68,6 +70,10 @@ HEALTH_CHECK_TIMEOUT = 600
 MAX_QUEUE_SIZE = 64                # max pending requests in the request_queue
 BATCH_WINDOW_MS = 50               # ms to wait for batch accumulation
 LRU_CACHE_SIZE = 128               # max entries in LRU scheduling cache
+
+# Upper bound for automatically-selected llama.cpp parallel slots per model.
+# Models can still set a smaller explicit parallel_slots value in models.py.
+MAX_PARALLEL_SLOTS = 4
 
 
 ### DATABASE
