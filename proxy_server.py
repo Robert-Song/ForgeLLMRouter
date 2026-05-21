@@ -35,8 +35,10 @@ async def lifespan(app: FastAPI):
     await request_queue.start()
     print("[Proxy] request_queue started. Process manager ready.")
     yield
-    await request_queue.stop()
-    await process_manager.cleanup()
+    try:
+        await request_queue.stop()
+    finally:
+        await asyncio.shield(process_manager.cleanup())
 
 app = FastAPI(title="OpenAI Proxy v6", lifespan=lifespan)
 
