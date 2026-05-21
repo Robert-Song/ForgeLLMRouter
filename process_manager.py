@@ -181,6 +181,36 @@ class ModelProcessManager:
         if port in self.used_ports:
             self.used_ports.remove(port)
 
+    def _terminate_process(self, model_id: str, process: subprocess.Popen, timeout: float = 10.0):
+        if process.poll() is not None:
+            return
+
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Process {model_id} did not terminate gracefully. Killing it.")
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                else:
+                    process.kill()
+                process.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+        except ProcessLookupError:
+            pass
+
+    def _close_log_file(self, process: subprocess.Popen):
+        if hasattr(process, "_log_file") and process._log_file:
+            try:
+                process._log_file.close()
+            except Exception:
+                pass
+
     async def check_health(self, port: int, process: subprocess.Popen, timeout: int = 1800) -> bool:
         # Poll the local endpoint to check if the subprocess is ready to accept requests.
         url = f"http://127.0.0.1:{port}/v1/models"
@@ -218,19 +248,25 @@ class ModelProcessManager:
         backend = model_info.backend
         
         from config import (
-            GGUF_MODEL_DIR, VLLM_MODEL_DIR, LLAMA_SERVER_BIN, 
-            CUDA_LIB_PATH, GPU_VISIBLE_DEVICES, HF_TOKEN, NUM_GPUS
+            GGUF_MODEL_DIR, VLLM_MODEL_DIR, LLAMA_SERVER_BIN,
+            CUDA_LIB_PATH, GPU_MEMORY_GB, GPU_VISIBLE_DEVICES, HF_TOKEN
         )
         
         env = os.environ.copy()
         env["HF_TOKEN"] = HF_TOKEN
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         if CUDA_LIB_PATH:
             env["LD_LIBRARY_PATH"] = f"{CUDA_LIB_PATH}:{env.get('LD_LIBRARY_PATH', '')}"
 
         if getattr(model_info, "gpu_index", None) is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(model_info.gpu_index)
-        elif GPU_VISIBLE_DEVICES:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(idx) for idx in GPU_VISIBLE_DEVICES)
+            visible_devices = [int(model_info.gpu_index)]
+        else:
+            visible_devices = list(GPU_VISIBLE_DEVICES)
+
+        if visible_devices:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(idx) for idx in visible_devices)
+        cuda_visible_devices = env.get("CUDA_VISIBLE_DEVICES", "")
+        tensor_parallel_size = max(1, len(visible_devices))
 
         # Build the command based on backend
         if backend == "vllm":
@@ -242,7 +278,7 @@ class ModelProcessManager:
                 "python", "-m", "vllm.entrypoints.openai.api_server",
                 "--model", model_path,
                 "--port", str(port),
-                "--tensor-parallel-size", str(NUM_GPUS),
+                "--tensor-parallel-size", str(tensor_parallel_size),
             ]
             hf_repo = getattr(model_info, "hf_repo", None)
             if hf_repo and _is_gguf_model(model_path) and not _args_include_flag(extra_args, _TOKENIZER_ALIASES):
@@ -279,6 +315,16 @@ class ModelProcessManager:
         os.makedirs("model_logs", exist_ok=True)
         safe_model_id = model_id.replace(':', '_').replace('/', '_')
         log_file = open(f"model_logs/{safe_model_id}.log", "w")
+        log_file.write(
+            f"[ForgeLLMRouter] model_id={model_id}\n"
+            f"[ForgeLLMRouter] backend={backend}\n"
+            f"[ForgeLLMRouter] port={port}\n"
+            f"[ForgeLLMRouter] GPU_MEMORY_GB={GPU_MEMORY_GB}\n"
+            f"[ForgeLLMRouter] CUDA_DEVICE_ORDER={env.get('CUDA_DEVICE_ORDER', '')}\n"
+            f"[ForgeLLMRouter] CUDA_VISIBLE_DEVICES={cuda_visible_devices}\n"
+            f"[ForgeLLMRouter] cmd={shlex.join(cmd)}\n\n"
+        )
+        log_file.flush()
         
         process = subprocess.Popen(
             cmd, 
@@ -290,6 +336,9 @@ class ModelProcessManager:
         
         # Store process info
         process._log_file = log_file # Keep reference to close later
+        process._cuda_visible_devices = cuda_visible_devices
+        process._cmd = cmd
+        process._backend = backend
         self.active_processes[model_id] = process
         self.model_ports[model_id] = port
         
@@ -306,7 +355,6 @@ class ModelProcessManager:
 
     async def unload_model(self, model_id: str):
         # unload a model by killing its subprocess and releasing the port.
-        import subprocess # HACK: Local import to prevent UnboundLocalError
         if model_id not in self.active_processes:
             return
 
@@ -314,29 +362,9 @@ class ModelProcessManager:
         port = self.model_ports.pop(model_id)
         
         logger.info(f"Unloading model {model_id} from port {port}")
-        
-        try:
-            # Send SIGTERM to the process group (Unix) or terminate tree (Windows)
-            if hasattr(os, 'killpg'):
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            else:
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], capture_output=True)
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Process {model_id} did not terminate gracefully. Killing it.")
-            if hasattr(os, 'killpg'):
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            else:
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], capture_output=True)
-        except ProcessLookupError:
-            pass # poke dead
-            
-        if hasattr(process, '_log_file') and process._log_file:
-            try:
-                process._log_file.close()
-            except:
-                pass
-                
+        self._terminate_process(model_id, process)
+        self._close_log_file(process)
+
         self._release_port(port)
         logger.info(f"Model {model_id} unloaded successfully.")
 
@@ -345,6 +373,19 @@ class ModelProcessManager:
         models = list(self.active_processes.keys())
         for model_id in models:
             await self.unload_model(model_id)
+
+    def cleanup_sync(self, timeout: float = 10.0):
+        # Synchronous fallback for interpreter exit or interrupted uvicorn shutdown.
+        models = list(self.active_processes.items())
+        for model_id, process in models:
+            port = self.model_ports.get(model_id)
+            logger.info(f"Emergency cleanup for model {model_id} from port {port}")
+            self.active_processes.pop(model_id, None)
+            self.model_ports.pop(model_id, None)
+            self._terminate_process(model_id, process, timeout=timeout)
+            self._close_log_file(process)
+            if port is not None:
+                self._release_port(port)
 
 from config import MODEL_PORT_START, MODEL_PORT_END
 process_manager = ModelProcessManager(MODEL_PORT_START, MODEL_PORT_END)

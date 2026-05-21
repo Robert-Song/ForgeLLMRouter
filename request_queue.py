@@ -16,6 +16,8 @@ import httpx
 from config import (
     BATCH_WINDOW_MS,
     GPU_HEADROOM_GB,
+    GPU_MEMORY_GB,
+    GPU_VISIBLE_DEVICES,
     MAX_QUEUE_SIZE,
     NUM_GPUS,
     TOTAL_USABLE_MEMORY_GB,
@@ -361,7 +363,7 @@ class RequestQueue:
                         f"exceeding memory budget {self._memory.budget_gb:.1f} GB"
                     )
 
-                if UNLOAD_IDLE_MODELS_BEFORE_LOAD:
+                if UNLOAD_IDLE_MODELS_BEFORE_LOAD and not self._memory.fits(model_id):
                     while True:
                         protected = self._busy_model_ids()
                         other_loaded = [
@@ -377,7 +379,7 @@ class RequestQueue:
                         if to_evict:
                             print(
                                 f"[request_queue] Unloading idle models {to_evict} "
-                                f"before loading '{model_id}'"
+                                f"to make room for '{model_id}'"
                             )
                             for evict_id in to_evict:
                                 await process_manager.unload_model(evict_id)
@@ -530,6 +532,7 @@ class RequestQueue:
                 "port": port,
                 "pid": process.pid,
                 "returncode": process.poll(),
+                "cuda_visible_devices": getattr(process, "_cuda_visible_devices", None),
                 "parallel_slots": runtime.parallel_slots,
                 "inflight": runtime.inflight,
                 "base_memory_gb": self._memory.base_memory_gb(model_id),
@@ -549,6 +552,13 @@ class RequestQueue:
                 "requests": requests,
             },
             "memory": memory,
+            "gpu_config": {
+                "gpu_memory_gb": GPU_MEMORY_GB,
+                "gpu_visible_devices": GPU_VISIBLE_DEVICES,
+                "num_gpus": NUM_GPUS,
+                "total_usable_memory_gb": TOTAL_USABLE_MEMORY_GB,
+                "gpu_headroom_gb": GPU_HEADROOM_GB,
+            },
             "loaded_models": loaded_models,
         }
 
