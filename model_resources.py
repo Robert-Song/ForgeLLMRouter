@@ -1,11 +1,14 @@
 import os
 import re
 import shlex
+import sqlite3
+import time
 from functools import lru_cache
 from typing import Optional
 
 from gguf import GGUFReader, GGUFValueType
 
+import config as runtime_config
 from config import (
     GGUF_MODEL_DIR,
     GPU_HEADROOM_GB,
@@ -19,6 +22,155 @@ MEMORY_BUDGET_GB = TOTAL_USABLE_MEMORY_GB - (GPU_HEADROOM_GB * NUM_GPUS)
 KV_CACHE_DTYPE_BYTES = 2
 MODEL_MEMORY_SAFETY_FACTOR = 1.10
 SLOT_MEMORY_SAFETY_FACTOR = 1.15
+MODEL_INFO_DB_PATH = getattr(runtime_config, "MODEL_INFO_DB_PATH", None)
+
+
+def _model_info_db_path() -> str:
+    if MODEL_INFO_DB_PATH:
+        return os.path.abspath(MODEL_INFO_DB_PATH)
+
+    config_file = getattr(runtime_config, "__file__", None)
+    if config_file:
+        config_dir = os.path.dirname(os.path.abspath(config_file))
+        return os.path.join(config_dir, "model_info.db")
+
+    return os.path.abspath("model_info.db")
+
+
+def model_info_db_path() -> str:
+    return _model_info_db_path()
+
+
+def _init_model_info_db(conn: sqlite3.Connection):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_vram_measurements (
+            model_id TEXT PRIMARY KEY,
+            backend TEXT NOT NULL,
+            backend_id TEXT NOT NULL,
+            model_type TEXT NOT NULL,
+            extra_args TEXT NOT NULL,
+            base_memory_gb REAL NOT NULL,
+            slot_memory_gb REAL NOT NULL,
+            parallel_1_memory_gb REAL NOT NULL,
+            parallel_2_memory_gb REAL,
+            measured_at REAL NOT NULL,
+            source TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def _model_signature(model_info) -> tuple[str, str, str, str, str]:
+    return (
+        getattr(model_info, "model_id", ""),
+        getattr(model_info, "backend", ""),
+        getattr(model_info, "backend_id", ""),
+        getattr(model_info, "model_type", ""),
+        getattr(model_info, "extra_args", "") or "",
+    )
+
+
+def get_measured_model_memory(model_info) -> Optional[dict]:
+    model_id, backend, backend_id, model_type, extra_args = _model_signature(model_info)
+    if not model_id:
+        return None
+
+    try:
+        with sqlite3.connect(_model_info_db_path()) as conn:
+            _init_model_info_db(conn)
+            row = conn.execute(
+                """
+                SELECT backend, backend_id, model_type, extra_args,
+                       base_memory_gb, slot_memory_gb,
+                       parallel_1_memory_gb, parallel_2_memory_gb,
+                       measured_at, source
+                FROM model_vram_measurements
+                WHERE model_id = ?
+                """,
+                (model_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        print(f"[MemoryBudget] Could not read {_model_info_db_path()}: {exc}")
+        return None
+
+    if row is None:
+        return None
+
+    row_backend, row_backend_id, row_model_type, row_extra_args = row[:4]
+    if (
+        row_backend != backend
+        or row_backend_id != backend_id
+        or row_model_type != model_type
+        or row_extra_args != extra_args
+    ):
+        return None
+
+    return {
+        "base_memory_gb": float(row[4]),
+        "slot_memory_gb": float(row[5]),
+        "parallel_1_memory_gb": float(row[6]),
+        "parallel_2_memory_gb": None if row[7] is None else float(row[7]),
+        "measured_at": float(row[8]),
+        "source": row[9],
+    }
+
+
+def has_measured_model_memory(model_info) -> bool:
+    return get_measured_model_memory(model_info) is not None
+
+
+def save_measured_model_memory(
+    model_info,
+    base_memory_gb: float,
+    slot_memory_gb: float,
+    parallel_1_memory_gb: float,
+    parallel_2_memory_gb: Optional[float],
+    source: str = "measure_vram.py",
+):
+    model_id, backend, backend_id, model_type, extra_args = _model_signature(model_info)
+    if not model_id:
+        raise ValueError("model_info has no model_id")
+
+    with sqlite3.connect(_model_info_db_path()) as conn:
+        _init_model_info_db(conn)
+        conn.execute(
+            """
+            INSERT INTO model_vram_measurements (
+                model_id, backend, backend_id, model_type, extra_args,
+                base_memory_gb, slot_memory_gb,
+                parallel_1_memory_gb, parallel_2_memory_gb,
+                measured_at, source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(model_id) DO UPDATE SET
+                backend = excluded.backend,
+                backend_id = excluded.backend_id,
+                model_type = excluded.model_type,
+                extra_args = excluded.extra_args,
+                base_memory_gb = excluded.base_memory_gb,
+                slot_memory_gb = excluded.slot_memory_gb,
+                parallel_1_memory_gb = excluded.parallel_1_memory_gb,
+                parallel_2_memory_gb = excluded.parallel_2_memory_gb,
+                measured_at = excluded.measured_at,
+                source = excluded.source
+            """,
+            (
+                model_id,
+                backend,
+                backend_id,
+                model_type,
+                extra_args,
+                float(base_memory_gb),
+                float(slot_memory_gb),
+                float(parallel_1_memory_gb),
+                None if parallel_2_memory_gb is None else float(parallel_2_memory_gb),
+                time.time(),
+                source,
+            ),
+        )
+        conn.commit()
 
 
 def _field_value(reader: GGUFReader, key: str):
@@ -113,6 +265,10 @@ def _gguf_tensor_bytes(path: str) -> int:
 
 
 def estimate_base_memory_gb(model_info) -> float:
+    measured = get_measured_model_memory(model_info)
+    if measured is not None:
+        return measured["base_memory_gb"]
+
     path = resolve_gguf_path(model_info)
     if not path:
         return 0.0
@@ -138,6 +294,10 @@ def estimate_slot_memory_gb(model_info) -> float:
     override = float(getattr(model_info, "slot_memory_gb", 0.0) or 0.0)
     if override > 0:
         return override
+
+    measured = get_measured_model_memory(model_info)
+    if measured is not None:
+        return measured["slot_memory_gb"]
 
     path = resolve_gguf_path(model_info)
     if not path or not os.path.exists(path):

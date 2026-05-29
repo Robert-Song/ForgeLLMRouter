@@ -158,6 +158,14 @@ def _check_quota(api_key: str, estimated_tokens: int):
         )
 
 
+def _backend_request_exception(model_id: str, exc: httpx.RequestError) -> HTTPException:
+    detail = f"Model backend connection failed for '{model_id}': {exc.__class__.__name__}"
+    message = str(exc)
+    if message:
+        detail = f"{detail}: {message}"
+    return HTTPException(status_code=502, detail=detail)
+
+
 # ============================================================================
 #  Forward to model backend
 # ============================================================================
@@ -374,6 +382,8 @@ async def chat_completions(
             status_code=502,
             detail=f"Model backend returned error {e.response.status_code}: {e.response.text[:200]}",
         )
+    except httpx.RequestError as e:
+        raise _backend_request_exception(requested_model, e)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -440,6 +450,8 @@ async def create_embeddings(
             status_code=502,
             detail=f"Model backend error {e.response.status_code}: {e.response.text[:200]}",
         )
+    except httpx.RequestError as e:
+        raise _backend_request_exception(model, e)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -487,6 +499,8 @@ async def rerank(
             status_code=502,
             detail=f"Model backend error {e.response.status_code}: {e.response.text[:200]}",
         )
+    except httpx.RequestError as e:
+        raise _backend_request_exception(model, e)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

@@ -8,7 +8,12 @@ import time
 import httpx
 from typing import Dict, Optional
 
-from model_resources import effective_parallel_slots
+from model_resources import (
+    effective_model_memory_gb,
+    effective_parallel_slots,
+    estimate_base_memory_gb,
+    estimate_slot_memory_gb,
+)
 
 # collection of functions that handle model loading and unloading
 
@@ -211,6 +216,29 @@ class ModelProcessManager:
             except Exception:
                 pass
 
+    def reap_exited_model(self, model_id: str) -> bool:
+        """Clear bookkeeping for a backend that already exited."""
+        process = self.active_processes.get(model_id)
+        if process is None:
+            return False
+
+        returncode = process.poll()
+        if returncode is None:
+            return False
+
+        port = self.model_ports.pop(model_id, None)
+        self.active_processes.pop(model_id, None)
+        self._close_log_file(process)
+        if port is not None:
+            self._release_port(port)
+        logger.warning(
+            "Cleared stale backend for %s from port %s after exit code %s",
+            model_id,
+            port,
+            returncode,
+        )
+        return True
+
     async def check_health(self, port: int, process: subprocess.Popen, timeout: int = 1800) -> bool:
         # Poll the local endpoint to check if the subprocess is ready to accept requests.
         url = f"http://127.0.0.1:{port}/v1/models"
@@ -237,8 +265,11 @@ class ModelProcessManager:
         # Spawns a new subprocess for the requested model based on its 'backend' config.
         # Waits for the health check to pass before returning.
         if model_id in self.active_processes:
-            logger.info(f"Model {model_id} is already loaded.")
-            return
+            if self.reap_exited_model(model_id):
+                logger.info(f"Reloading {model_id} after stale backend cleanup.")
+            else:
+                logger.info(f"Model {model_id} is already loaded.")
+                return
 
         if not hasattr(model_info, "backend"):
             raise ValueError(f"Invalid model_info object for model {model_id}")
@@ -249,13 +280,16 @@ class ModelProcessManager:
         
         from config import (
             GGUF_MODEL_DIR, VLLM_MODEL_DIR, LLAMA_SERVER_BIN,
-            CUDA_LIB_PATH, GPU_MEMORY_GB, GPU_VISIBLE_DEVICES, HF_TOKEN
+            BACKEND_LD_LIBRARY_PATH, CUDA_LIB_PATH, GPU_MEMORY_GB,
+            GPU_VISIBLE_DEVICES, HF_TOKEN
         )
         
         env = os.environ.copy()
         env["HF_TOKEN"] = HF_TOKEN
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        if CUDA_LIB_PATH:
+        if BACKEND_LD_LIBRARY_PATH is not None:
+            env["LD_LIBRARY_PATH"] = BACKEND_LD_LIBRARY_PATH
+        elif CUDA_LIB_PATH:
             env["LD_LIBRARY_PATH"] = f"{CUDA_LIB_PATH}:{env.get('LD_LIBRARY_PATH', '')}"
 
         if getattr(model_info, "gpu_index", None) is not None:
@@ -315,6 +349,10 @@ class ModelProcessManager:
         os.makedirs("model_logs", exist_ok=True)
         safe_model_id = model_id.replace(':', '_').replace('/', '_')
         log_file = open(f"model_logs/{safe_model_id}.log", "w")
+        estimated_base_memory_gb = estimate_base_memory_gb(model_info)
+        estimated_slot_memory_gb = estimate_slot_memory_gb(model_info)
+        estimated_parallel_slots = effective_parallel_slots(model_info)
+        estimated_total_memory_gb = effective_model_memory_gb(model_info)
         log_file.write(
             f"[ForgeLLMRouter] model_id={model_id}\n"
             f"[ForgeLLMRouter] backend={backend}\n"
@@ -322,6 +360,11 @@ class ModelProcessManager:
             f"[ForgeLLMRouter] GPU_MEMORY_GB={GPU_MEMORY_GB}\n"
             f"[ForgeLLMRouter] CUDA_DEVICE_ORDER={env.get('CUDA_DEVICE_ORDER', '')}\n"
             f"[ForgeLLMRouter] CUDA_VISIBLE_DEVICES={cuda_visible_devices}\n"
+            f"[ForgeLLMRouter] LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH', '')}\n"
+            f"[ForgeLLMRouter] estimated_base_memory_gb={estimated_base_memory_gb:.3f}\n"
+            f"[ForgeLLMRouter] estimated_slot_memory_gb={estimated_slot_memory_gb:.3f}\n"
+            f"[ForgeLLMRouter] estimated_parallel_slots={estimated_parallel_slots}\n"
+            f"[ForgeLLMRouter] estimated_total_memory_gb={estimated_total_memory_gb:.3f}\n"
             f"[ForgeLLMRouter] cmd={shlex.join(cmd)}\n\n"
         )
         log_file.flush()

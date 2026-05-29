@@ -8,7 +8,7 @@ Change the values at the top to match your HPC environment.
 
 # GPU memory available for model loading (in GB). Set a GPU to 0 to exclude it
 # from both the scheduler budget and backend CUDA visibility.
-GPU_MEMORY_GB = [42, 0, 42]
+GPU_MEMORY_GB = [42, 42, 42] #birck, temp
 GPU_VISIBLE_DEVICES = [idx for idx, gb in enumerate(GPU_MEMORY_GB) if gb > 0]
 NUM_GPUS = len(GPU_VISIBLE_DEVICES)
 TOTAL_USABLE_MEMORY_GB = sum(GPU_MEMORY_GB)
@@ -66,6 +66,11 @@ CUDA_LIB_PATH = _os.pathsep.join(
     dict.fromkeys(path for path in _CUDA_LIB_PATHS if _os.path.isdir(path))
 )
 
+# Optional exact LD_LIBRARY_PATH for spawned model backends. Use this on machines
+# where the default CUDA path would select a runtime newer than the installed
+# driver supports.
+BACKEND_LD_LIBRARY_PATH = _os.environ.get("FORGE_BACKEND_LD_LIBRARY_PATH")
+
 # llama-server binary path (from llama.cpp build)
 # XXX: this line is CPU only version, only use to test, do not use actually
 # LLAMA_SERVER_BIN = "/.gavea/store/song669/temp/llama-b7999/llama-server"
@@ -87,7 +92,6 @@ MODEL_PORT_END = 8090
 # Health check timeout (in seconds)
 HEALTH_CHECK_TIMEOUT = 600
 
-
 ### request_queue / BATCHING SETTINGS
 
 MAX_QUEUE_SIZE = 64                # max pending requests in the request_queue
@@ -96,11 +100,11 @@ LRU_CACHE_SIZE = 128               # max entries in LRU scheduling cache
 
 # Upper bound for automatically-selected llama.cpp parallel slots per model.
 # Models can still set a smaller explicit parallel_slots value in models.py.
-MAX_PARALLEL_SLOTS = 4
+MAX_PARALLEL_SLOTS = 16
 
 # llama.cpp's fit/load behavior can reserve substantially more VRAM than the
-# static GGUF tensor + KV estimates, especially with parallel slots. Keep one
-# active model loaded at a time unless a request targets an already-loaded model.
+# static GGUF tensor + KV estimates, especially with parallel slots. When a new
+# model does not fit under the scheduler budget, unload idle models before load.
 UNLOAD_IDLE_MODELS_BEFORE_LOAD = True
 
 

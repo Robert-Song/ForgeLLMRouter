@@ -28,6 +28,8 @@ from model_resources import (
     effective_parallel_slots,
     estimate_base_memory_gb,
     estimate_slot_memory_gb,
+    has_measured_model_memory,
+    model_info_db_path,
 )
 from models import MODEL_REGISTRY
 from process_manager import process_manager
@@ -159,6 +161,8 @@ class MemoryBudget:
 
 
 class RequestQueue:
+    MEASUREMENT_SETTLE_SECONDS = 5.0
+
     def __init__(self):
         self._queue: Optional[asyncio.Queue[QueuedRequest]] = None
         self._memory = MemoryBudget()
@@ -168,6 +172,11 @@ class RequestQueue:
         self._forward_fn: Optional[Callable[..., Awaitable[Any]]] = None
         self._runtimes: Dict[str, ModelRuntimeState] = {}
         self._memory_condition = asyncio.Condition()
+        self._load_gate = asyncio.Lock()
+        self._measurement_lock = asyncio.Lock()
+        self._maintenance_condition = asyncio.Condition()
+        self._maintenance_active = False
+        self._maintenance_reason: Optional[str] = None
         self._state_lock = asyncio.Lock()
         self._request_seq = 0
         self._request_states: OrderedDict[int, dict] = OrderedDict()
@@ -192,6 +201,7 @@ class RequestQueue:
                 pass
 
     async def enqueue(self, model_id: str, request_body: dict, api_key: str) -> Any:
+        await self._wait_for_admission()
         request_id = await self._next_request_id()
         req = QueuedRequest(
             model_id=model_id,
@@ -227,6 +237,40 @@ class RequestQueue:
     async def _remove_request_state(self, request_id: int):
         async with self._state_lock:
             self._request_states.pop(request_id, None)
+        async with self._memory_condition:
+            self._memory_condition.notify_all()
+
+    async def _wait_for_admission(self):
+        async with self._maintenance_condition:
+            while self._maintenance_active:
+                await self._maintenance_condition.wait()
+
+    async def _set_maintenance(self, active: bool, reason: Optional[str] = None):
+        async with self._maintenance_condition:
+            self._maintenance_active = active
+            self._maintenance_reason = reason if active else None
+            self._maintenance_condition.notify_all()
+
+    async def _wait_for_forwarded_requests_to_finish(self):
+        while True:
+            async with self._state_lock:
+                inflight_request_ids = [
+                    request_id
+                    for request_id, item in self._request_states.items()
+                    if item["state"] == "inflight"
+                ]
+            if not inflight_request_ids:
+                return
+
+            print(
+                "[request_queue] Waiting for forwarded requests to finish before "
+                f"VRAM measurement: {inflight_request_ids}"
+            )
+            async with self._memory_condition:
+                try:
+                    await asyncio.wait_for(self._memory_condition.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
 
     def _runtime_for(self, model_id: str) -> ModelRuntimeState:
         model = MODEL_REGISTRY.get(model_id)
@@ -246,6 +290,72 @@ class RequestQueue:
             model_id for model_id, state in self._runtimes.items()
             if state.inflight > 0 or state.loading
         }
+
+    async def _protected_model_ids(self) -> set[str]:
+        protected = self._busy_model_ids()
+        async with self._state_lock:
+            protected.update(
+                item["model_id"]
+                for item in self._request_states.values()
+                if item["state"] == "inflight"
+            )
+        return protected
+
+    def _known_loaded_model_ids(self) -> List[str]:
+        known = OrderedDict((model_id, None) for model_id in self._memory.loaded_model_ids())
+        for model_id in process_manager.active_processes.keys():
+            known.setdefault(model_id, None)
+        return list(known.keys())
+
+    def _reap_exited_models_locked(self) -> List[str]:
+        reaped = []
+        for loaded_id in list(process_manager.active_processes.keys()):
+            if process_manager.reap_exited_model(loaded_id):
+                self._memory.evict(loaded_id)
+                reaped.append(loaded_id)
+        if reaped:
+            print(f"[request_queue] Cleared stale exited backends: {reaped}")
+        return reaped
+
+    async def _ensure_model_measured(self, model_id: str, model_info):
+        if model_info.backend != "llamacpp" or has_measured_model_memory(model_info):
+            return
+
+        async with self._measurement_lock:
+            if has_measured_model_memory(model_info):
+                return
+
+            async with self._load_gate:
+                runtime = self._runtime_for(model_id)
+                async with self._memory_condition:
+                    self._reap_exited_models_locked()
+                    if model_id in process_manager.active_processes:
+                        return
+                    runtime.loading = True
+                    self._memory_condition.notify_all()
+
+                reason = f"measuring VRAM for '{model_id}'"
+                await self._set_maintenance(True, reason)
+                try:
+                    print(f"[request_queue] Pausing request admission for {reason}")
+                    await self._wait_for_forwarded_requests_to_finish()
+
+                    print(f"[request_queue] Unloading all models before measuring '{model_id}'")
+                    await self.unload_all(force=True)
+                    await asyncio.sleep(self.MEASUREMENT_SETTLE_SECONDS)
+
+                    print(f"[request_queue] Measuring VRAM for '{model_id}' into {model_info_db_path()}")
+                    from measure_vram import ensure_model_measured
+
+                    await asyncio.to_thread(ensure_model_measured, model_id)
+                except Exception as exc:
+                    print(f"[request_queue] VRAM measurement failed for '{model_id}': {exc}")
+                    raise
+                finally:
+                    async with self._memory_condition:
+                        runtime.loading = False
+                        self._memory_condition.notify_all()
+                    await self._set_maintenance(False)
 
     async def _process_loop(self):
         while self._running:
@@ -339,84 +449,101 @@ class RequestQueue:
         model_info = MODEL_REGISTRY.get(model_id)
         if not model_info:
             raise ValueError(f"Model '{model_id}' not found in registry")
-        parallel_slots = effective_parallel_slots(model_info, budget_gb=self._memory.budget_gb)
-        slot_memory_gb = estimate_slot_memory_gb(model_info)
-        if parallel_slots > 1 and slot_memory_gb <= 0:
-            raise RuntimeError(
-                f"Model '{model_id}' has parallel_slots={parallel_slots} but no "
-                "positive slot memory estimate. Set ctx_size/extra_args --ctx-size "
-                "and ensure the local GGUF metadata is readable, or set slot_memory_gb."
-            )
+        await self._ensure_model_measured(model_id, model_info)
 
-        runtime = self._runtime_for(model_id)
-        async with runtime.load_lock:
-            async with self._memory_condition:
-                if model_id in process_manager.active_processes:
-                    self._memory.touch(model_id)
-                    self._memory_condition.notify_all()
-                    return process_manager.model_ports[model_id]
+        async with self._load_gate:
+            parallel_slots = effective_parallel_slots(model_info, budget_gb=self._memory.budget_gb)
+            slot_memory_gb = estimate_slot_memory_gb(model_info)
+            if parallel_slots > 1 and slot_memory_gb <= 0:
+                raise RuntimeError(
+                    f"Model '{model_id}' has parallel_slots={parallel_slots} but no "
+                    "positive slot memory estimate. Set ctx_size/extra_args --ctx-size "
+                    "and ensure the local GGUF metadata is readable, or set slot_memory_gb."
+                )
 
-                needed = self._memory.model_memory_gb(model_id)
-                if needed > self._memory.budget_gb:
-                    raise RuntimeError(
-                        f"Model '{model_id}' needs {needed:.1f} GB, "
-                        f"exceeding memory budget {self._memory.budget_gb:.1f} GB"
-                    )
+            runtime = self._runtime_for(model_id)
+            async with runtime.load_lock:
+                async with self._memory_condition:
+                    self._reap_exited_models_locked()
+                    if model_id in process_manager.active_processes:
+                        self._memory.touch(model_id)
+                        self._memory_condition.notify_all()
+                        return process_manager.model_ports[model_id]
 
-                if UNLOAD_IDLE_MODELS_BEFORE_LOAD and not self._memory.fits(model_id):
-                    while True:
-                        protected = self._busy_model_ids()
-                        other_loaded = [
-                            loaded_id
-                            for loaded_id in self._memory.loaded_model_ids()
-                            if loaded_id != model_id
-                        ]
-                        to_evict = [
-                            loaded_id
-                            for loaded_id in other_loaded
-                            if loaded_id not in protected
-                        ]
+                    needed = self._memory.model_memory_gb(model_id)
+                    if needed > self._memory.budget_gb:
+                        raise RuntimeError(
+                            f"Model '{model_id}' needs {needed:.1f} GB, "
+                            f"exceeding memory budget {self._memory.budget_gb:.1f} GB"
+                        )
+
+                    if UNLOAD_IDLE_MODELS_BEFORE_LOAD and not self._memory.fits(model_id):
+                        while True:
+                            protected = await self._protected_model_ids()
+                            other_loaded = [
+                                loaded_id
+                                for loaded_id in self._known_loaded_model_ids()
+                                if loaded_id != model_id
+                            ]
+                            to_evict = [
+                                loaded_id
+                                for loaded_id in other_loaded
+                                if loaded_id not in protected
+                            ]
+                            if to_evict:
+                                print(
+                                    f"[request_queue] Unloading idle models {to_evict} "
+                                    f"to make room for '{model_id}'"
+                                )
+                                for evict_id in to_evict:
+                                    if evict_id in await self._protected_model_ids():
+                                        continue
+                                    evict_state = self._runtimes.get(evict_id)
+                                    if evict_state and (evict_state.inflight > 0 or evict_state.loading):
+                                        continue
+                                    await process_manager.unload_model(evict_id)
+                                    self._memory.evict(evict_id)
+                                continue
+                            if other_loaded:
+                                await self._memory_condition.wait()
+                                continue
+                            break
+
+                    while not self._memory.fits(model_id):
+                        to_evict = self._memory.models_to_evict(
+                            model_id,
+                            await self._protected_model_ids(),
+                        )
                         if to_evict:
-                            print(
-                                f"[request_queue] Unloading idle models {to_evict} "
-                                f"to make room for '{model_id}'"
-                            )
+                            print(f"[request_queue] Evicting models {to_evict} to fit '{model_id}'")
                             for evict_id in to_evict:
+                                if evict_id in await self._protected_model_ids():
+                                    continue
+                                evict_state = self._runtimes.get(evict_id)
+                                if evict_state and (evict_state.inflight > 0 or evict_state.loading):
+                                    continue
                                 await process_manager.unload_model(evict_id)
                                 self._memory.evict(evict_id)
                             continue
-                        if other_loaded:
-                            await self._memory_condition.wait()
-                            continue
-                        break
+                        await self._memory_condition.wait()
 
-                while not self._memory.fits(model_id):
-                    to_evict = self._memory.models_to_evict(model_id, self._busy_model_ids())
-                    if to_evict:
-                        print(f"[request_queue] Evicting models {to_evict} to fit '{model_id}'")
-                        for evict_id in to_evict:
-                            await process_manager.unload_model(evict_id)
-                            self._memory.evict(evict_id)
-                        continue
-                    await self._memory_condition.wait()
+                    self._memory.touch(model_id)
+                    runtime.loading = True
 
-                self._memory.touch(model_id)
-                runtime.loading = True
+                load_succeeded = False
+                try:
+                    await process_manager.load_model(model_id, model_info)
+                    load_succeeded = True
+                finally:
+                    async with self._memory_condition:
+                        runtime.loading = False
+                        if load_succeeded:
+                            self._memory.touch(model_id)
+                        else:
+                            self._memory.evict(model_id)
+                        self._memory_condition.notify_all()
 
-            load_succeeded = False
-            try:
-                await process_manager.load_model(model_id, model_info)
-                load_succeeded = True
-            finally:
-                async with self._memory_condition:
-                    runtime.loading = False
-                    if load_succeeded:
-                        self._memory.touch(model_id)
-                    else:
-                        self._memory.evict(model_id)
-                    self._memory_condition.notify_all()
-
-            return process_manager.model_ports[model_id]
+                return process_manager.model_ports[model_id]
 
     @asynccontextmanager
     async def model_slot(
@@ -442,22 +569,26 @@ class RequestQueue:
         runtime = self._runtime_for(model_id)
         acquired = False
         try:
+            await self._wait_for_admission()
             await self._set_request_state(req, "waiting_slot")
             await runtime.semaphore.acquire()
             acquired = True
-            runtime.inflight += 1
+            async with self._memory_condition:
+                runtime.inflight += 1
+                self._memory_condition.notify_all()
             await self._set_request_state(req, "waiting_model")
             port = await self.ensure_model_loaded(model_id)
             await self._set_request_state(req, "inflight")
             yield port
         finally:
             if acquired:
-                runtime.inflight = max(0, runtime.inflight - 1)
-                runtime.semaphore.release()
                 async with self._memory_condition:
+                    runtime.inflight = max(0, runtime.inflight - 1)
+                    self._reap_exited_models_locked()
                     if model_id in process_manager.active_processes:
                         self._memory.touch(model_id)
                     self._memory_condition.notify_all()
+                runtime.semaphore.release()
             if created_record or request_id is not None:
                 await self._remove_request_state(request_id)
 
@@ -521,6 +652,10 @@ class RequestQueue:
         async with self._memory_condition:
             memory = self._memory.snapshot()
 
+        async with self._maintenance_condition:
+            maintenance_active = self._maintenance_active
+            maintenance_reason = self._maintenance_reason
+
         loaded_models = []
         for model_id, process in process_manager.active_processes.items():
             model = MODEL_REGISTRY.get(model_id)
@@ -547,6 +682,8 @@ class RequestQueue:
             "queue": {
                 "max_size": MAX_QUEUE_SIZE,
                 "depth": self._queue.qsize() if self._queue else 0,
+                "maintenance_active": maintenance_active,
+                "maintenance_reason": maintenance_reason,
                 "queued_by_model": dict(queued_counts),
                 "inflight_by_model": inflight_counts,
                 "requests": requests,
